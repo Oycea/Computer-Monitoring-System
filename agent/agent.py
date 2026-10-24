@@ -472,8 +472,9 @@ def execute_tool(name: str, raw_args: str) -> str:
         return function(**args)
     except TypeError as exc:
         return f"ОШИБКА: неверные аргументы для {name}: {exc}"
-    except ValueError as exc:
-        # Ошибки валидации инструменты формулируют сами — класс исключения не нужен.
+    except (ValueError, OSError) as exc:
+        # Ошибки валидации и файловых операций инструменты формулируют сами,
+        # поэтому имя класса исключения в текст не попадает.
         return f"ОШИБКА: {exc}"
     except Exception as exc:  # noqa: BLE001 — любую ошибку возвращаем строкой
         return f"ОШИБКА: {type(exc).__name__}: {exc}"
