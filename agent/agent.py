@@ -46,6 +46,9 @@ API_KEY_VARS = ("ROUTERAI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
 EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit", "выход"}
 RESET_COMMANDS = {"/reset", "/clear"}
 
+# Согласием на запись считается только явный ответ; Enter и всё остальное — отказ.
+CONFIRM_YES = {"y", "yes", "д", "да"}
+
 # Рабочая папка агента: инструменты не выходят за её пределы.
 WORKSPACE = Path(__file__).with_name("workspace")
 
@@ -92,6 +95,31 @@ TOOLS = [
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Создать или перезаписать текстовый файл в рабочей директории агента. "
+                "Изменяет файловую систему, поэтому пользователь подтверждает запись "
+                "вручную; при отказе файл остаётся без изменений."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Относительный путь к файлу внутри рабочей папки.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Полное новое содержимое файла.",
+                    },
+                },
+                "required": ["path", "content"],
             },
         },
     },
@@ -144,9 +172,53 @@ def read_file(path: str) -> str:
     return text or "(файл пуст)"
 
 
+def write_file(path: str, content: str) -> str:
+    """Создаёт или перезаписывает файл, но только после подтверждения.
+
+    Запись меняет файловую систему, поэтому перед ней печатается путь и
+    фрагмент содержимого, а затем задаётся вопрос «Разрешить? [y/N]».
+    Подтверждением считается только явное «y»/«да»; Enter, «n», Ctrl+D
+    и Ctrl+C означают отказ, и файл остаётся без изменений.
+    """
+    target = _resolve_in_workspace(path)
+    if target.is_dir():
+        raise IsADirectoryError(f"это папка, записать файл нельзя: {path}")
+
+    exists = target.exists()
+    action = "перезаписать" if exists else "создать"
+    done = "перезаписан" if exists else "создан"
+
+    print()
+    print(f"[подтверждение] {action} файл: {path}")
+    if exists:
+        print(f"  сейчас в файле {target.stat().st_size} байт")
+    print(f"  новый размер: {len(content)} символов")
+    print("  --- начало содержимого ---")
+    for line in content.splitlines()[:10] or [""]:
+        print(f"  | {line}")
+    if len(content.splitlines()) > 10:
+        print(f"  | ... ещё {len(content.splitlines()) - 10} строк")
+    print("  --- конец ---")
+
+    try:
+        answer = input("Разрешить? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # Нет ввода (Ctrl+D/Ctrl+C) — это не согласие.
+        print()
+        answer = ""
+
+    if answer not in CONFIRM_YES:
+        return f"ОТКАЗ: пользователь не разрешил запись файла '{path}'. Файл не изменён."
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"OK: файл '{path}' {done} ({len(content)} символов)."
+
+
 TOOL_FUNCTIONS = {
     "list_files": list_files,
     "read_file": read_file,
+    "write_file": write_file,
 }
 
 
@@ -283,7 +355,7 @@ def run_agent(client: OpenAI, model: str, messages: list[dict], max_steps: int =
         messages.append(message.model_dump(exclude_none=True))
 
         if not tool_calls:
-            return message.content or ""
+            return message.content or "(модель вернула пустой ответ)"
 
         for call in tool_calls:
             name = call.function.name
@@ -293,13 +365,19 @@ def run_agent(client: OpenAI, model: str, messages: list[dict], max_steps: int =
             result = execute_tool(name, raw_args)
             print(f"[шаг {step}] результат {name}: {preview(result)}")
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result,
-                }
-            )
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result,
+            }
+            messages.append(tool_message)
+
+            # AGENT_DEBUG=1 — печатать точное сообщение, которое получит модель.
+            if os.getenv("AGENT_DEBUG"):
+                print(
+                    f"[шаг {step}] модели отправлено: "
+                    f"{json.dumps(tool_message, ensure_ascii=False)}"
+                )
 
     # Лимит шагов исчерпан — честно сообщаем об этом и модели, и пользователю.
     print(f"Достигнут лимит MAX_STEPS={max_steps}, агент остановлен.", file=sys.stderr)
