@@ -1,13 +1,15 @@
 """Лабораторная работа №2. Агент с доступом к LLM.
 
 Режимы запуска:
-    python agent.py           — интерактивный чат с инструментами (шаги 2–3);
+    python agent.py           — интерактивный чат с инструментами (шаги 2–5);
     python agent.py --once    — один запрос без инструментов (шаг 1).
 
 Агент умеет работать с файлами в каталоге agent/workspace через инструменты
-list_files и read_file. Модель сама решает, когда их вызвать: ответ приходит
-с tool_calls, агент выполняет вызовы и возвращает результаты модели, пока она
-не даст обычный текстовый ответ (не длиннее MAX_STEPS шагов).
+list_files, read_file и write_file, а также вести журнал мониторинга
+компьютеров инструментами record_metric и list_computers (данные — в
+agent/workspace/telemetry.json). Модель сама решает, когда их вызвать: ответ
+приходит с tool_calls, агент выполняет вызовы и возвращает результаты модели,
+пока она не даст обычный текстовый ответ (не длиннее MAX_STEPS шагов).
 
 Настройки берутся из agent/.env (см. agent/.env.example).
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,7 +40,9 @@ DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_SYSTEM_PROMPT = (
     "Ты — ассистент проекта Computer Monitoring System. "
     "Отвечай на русском языке, кратко и по делу. "
-    "Если для ответа нужны файлы, используй инструменты list_files и read_file."
+    "Показатели компьютеров фиксируй через record_metric, а состояние парка "
+    "машин смотри через list_computers. "
+    "Для работы с прочими файлами используй list_files, read_file и write_file."
 )
 
 # Имена переменных, в которых может лежать ключ, в порядке приоритета.
@@ -120,6 +125,76 @@ TOOLS = [
                     },
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_metric",
+            "description": (
+                "Записать новый замер компьютера в журнал мониторинга. "
+                "Вызывай, когда пользователь сообщает показатели машины (CPU, RAM, диск, "
+                "температуру) или просит зафиксировать её состояние. "
+                "Проценты — от 0 до 100, температура — в градусах Цельсия (0..150). "
+                "Состояние ok/warning/critical считается по порогам автоматически."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "computer": {
+                        "type": "string",
+                        "description": "Имя компьютера, например WS-01.",
+                    },
+                    "cpu_percent": {
+                        "type": "number",
+                        "description": "Загрузка процессора, % (0..100).",
+                    },
+                    "ram_percent": {
+                        "type": "number",
+                        "description": "Использование оперативной памяти, % (0..100).",
+                    },
+                    "disk_percent": {
+                        "type": "number",
+                        "description": "Занято дискового пространства, % (0..100).",
+                    },
+                    "temperature_c": {
+                        "type": "number",
+                        "description": "Температура процессора, °C (0..150).",
+                    },
+                },
+                "required": [
+                    "computer",
+                    "cpu_percent",
+                    "ram_percent",
+                    "disk_percent",
+                    "temperature_c",
+                ],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_computers",
+            "description": (
+                "Показать последние замеры компьютеров и их состояние по порогам. "
+                "Вызывай, когда нужно узнать, какие машины на связи, у кого превышены "
+                "пороги или кто находится в критическом состоянии."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["all", "ok", "warning", "critical"],
+                        "description": (
+                            "Фильтр по состоянию: all — все машины (по умолчанию), "
+                            "ok — в норме, warning — превышены пороги, critical — критично."
+                        ),
+                    }
+                },
+                "required": [],
             },
         },
     },
@@ -215,10 +290,161 @@ def write_file(path: str, content: str) -> str:
     return f"OK: файл '{path}' {done} ({len(content)} символов)."
 
 
+# --- инструменты проекта: журнал мониторинга (шаг 5) -----------------------
+
+# Все данные инструментов проекта лежат в JSON-файле внутри workspace/.
+TELEMETRY_FILE = WORKSPACE / "telemetry.json"
+MAX_RECORDS_PER_COMPUTER = 50
+MAX_COMPUTER_NAME = 64
+
+# Пороги: превышение — предупреждение, сильное превышение — критично.
+THRESHOLDS = {
+    "cpu_percent": (80.0, 90.0),
+    "ram_percent": (80.0, 90.0),
+    "disk_percent": (85.0, 95.0),
+    "temperature_c": (70.0, 85.0),
+}
+METRIC_LABELS = {
+    "cpu_percent": "cpu",
+    "ram_percent": "ram",
+    "disk_percent": "disk",
+    "temperature_c": "temp",
+}
+ALLOWED_STATUSES = ("all", "ok", "warning", "critical")
+
+
+def _fmt_number(value: float) -> str:
+    """42.0 → «42», 41.5 → «41.5» — чтобы результат был коротким."""
+    return f"{value:.0f}" if float(value).is_integer() else f"{value:.1f}"
+
+
+def _check_number(field: str, value: object, low: float, high: float) -> float:
+    """Проверяет, что значение — число в допустимом диапазоне."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} должен быть числом, получено {value!r}")
+    if not low <= value <= high:
+        raise ValueError(
+            f"{field} должен быть в диапазоне {_fmt_number(low)}..{_fmt_number(high)}, "
+            f"получено {_fmt_number(value)}"
+        )
+    return float(value)
+
+
+def _load_telemetry() -> dict:
+    """Читает telemetry.json; отсутствие файла означает пустой журнал."""
+    if not TELEMETRY_FILE.exists():
+        return {"computers": {}}
+
+    try:
+        data = json.loads(TELEMETRY_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"файл telemetry.json повреждён ({exc.msg}), исправьте или удалите его"
+        ) from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("computers"), dict):
+        raise ValueError('файл telemetry.json имеет неверный формат, ожидался {"computers": {...}}')
+    return data
+
+
+def _save_telemetry(data: dict) -> None:
+    """Записывает журнал обратно в telemetry.json (данные инструмента, без подтверждения)."""
+    WORKSPACE.mkdir(exist_ok=True)
+    TELEMETRY_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _evaluate(record: dict) -> str:
+    """Состояние машины по одному замеру: ok / warning / critical."""
+    state = "ok"
+    for field, (warn, crit) in THRESHOLDS.items():
+        value = record.get(field)
+        if value is None:
+            continue
+        if value >= crit:
+            return "critical"
+        if value >= warn:
+            state = "warning"
+    return state
+
+
+def _describe(record: dict) -> str:
+    """Короткая строка показателей: «cpu 34%, ram 62%…»."""
+    parts = []
+    for field, label in METRIC_LABELS.items():
+        value = record.get(field)
+        if value is None:
+            continue
+        unit = "°C" if field == "temperature_c" else "%"
+        parts.append(f"{label} {_fmt_number(value)}{unit}")
+    return ", ".join(parts) if parts else "нет показателей"
+
+
+def record_metric(computer: str, cpu_percent, ram_percent, disk_percent, temperature_c) -> str:
+    """Сохраняет замер компьютера в telemetry.json и возвращает короткий итог."""
+    name = (computer or "").strip()
+    if not name:
+        raise ValueError("computer не должен быть пустым")
+    if len(name) > MAX_COMPUTER_NAME:
+        raise ValueError(f"computer слишком длинный, максимум {MAX_COMPUTER_NAME} символов")
+
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "computer": name,
+        "cpu_percent": _check_number("cpu_percent", cpu_percent, 0, 100),
+        "ram_percent": _check_number("ram_percent", ram_percent, 0, 100),
+        "disk_percent": _check_number("disk_percent", disk_percent, 0, 100),
+        "temperature_c": _check_number("temperature_c", temperature_c, 0, 150),
+    }
+
+    data = _load_telemetry()
+    records = data["computers"].setdefault(name, [])
+    records.append(record)
+    # Держим только последние замеры, чтобы файл не рос бесконечно.
+    del records[:-MAX_RECORDS_PER_COMPUTER]
+    _save_telemetry(data)
+
+    return (
+        f"OK: {name} — {_describe(record)}; состояние {_evaluate(record)} "
+        f"(записей: {len(records)})"
+    )
+
+
+def list_computers(status: str = "all") -> str:
+    """Показывает последние замеры компьютеров, при необходимости с фильтром."""
+    status = (status or "all").strip().lower()
+    if status not in ALLOWED_STATUSES:
+        allowed = ", ".join(ALLOWED_STATUSES)
+        raise ValueError(f"status должен быть одним из: {allowed}; получено {status!r}")
+
+    computers = _load_telemetry()["computers"]
+    if not computers:
+        return "Журнал пуст: ни один компьютер ещё не присылал замеры."
+
+    lines = []
+    for name in sorted(computers):
+        records = computers[name]
+        if not records:
+            continue
+        last = records[-1]
+        state = _evaluate(last)
+        if status != "all" and state != status:
+            continue
+        lines.append(f"{name}: {state} — {_describe(last)} ({last.get('timestamp', '—')})")
+
+    if not lines:
+        return f"Нет компьютеров в состоянии {status}."
+    return "\n".join([f"Компьютеров в выборке: {len(lines)}", *lines[:MAX_ITEMS]])
+
+
 TOOL_FUNCTIONS = {
     "list_files": list_files,
     "read_file": read_file,
     "write_file": write_file,
+    "record_metric": record_metric,
+    "list_computers": list_computers,
 }
 
 
@@ -246,6 +472,9 @@ def execute_tool(name: str, raw_args: str) -> str:
         return function(**args)
     except TypeError as exc:
         return f"ОШИБКА: неверные аргументы для {name}: {exc}"
+    except ValueError as exc:
+        # Ошибки валидации инструменты формулируют сами — класс исключения не нужен.
+        return f"ОШИБКА: {exc}"
     except Exception as exc:  # noqa: BLE001 — любую ошибку возвращаем строкой
         return f"ОШИБКА: {type(exc).__name__}: {exc}"
 
