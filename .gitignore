@@ -1,2 +1,6 @@
 .env
 agent/workspace/
+
+# служебные файлы Python
+__pycache__/
+*.pyc

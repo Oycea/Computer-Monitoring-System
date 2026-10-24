@@ -1,29 +1,20 @@
-"""Шаг 2. Чат с историей.
+"""Лабораторная работа №2. Агент с доступом к LLM.
 
-Скрипт держит диалог с моделью в цикле input(). Вся переписка хранится
-в одном списке messages:
+Режимы запуска:
+    python agent.py           — интерактивный чат с инструментами (шаги 2–3);
+    python agent.py --once    — один запрос без инструментов (шаг 1).
 
-* первым элементом всегда идёт системный промпт (роль "system");
-* каждый вопрос пользователя добавляется как {"role": "user", ...};
-* каждый ответ модели добавляется как {"role": "assistant", ...}.
-
-Список целиком отправляется в модель на каждом шаге, поэтому она видит
-предыдущие реплики и может отвечать с учётом контекста.
-
-Запуск:
-    python agent.py           — интерактивный чат;
-    python agent.py --once    — один запрос из шага 1 (проверка content,
-                               finish_reason и usage без истории).
-
-Команды в чате:
-    /reset, /clear  — очистить историю (системный промпт остаётся);
-    /exit, /quit    — выйти (то же самое делают exit, quit и Ctrl+D).
+Агент умеет работать с файлами в каталоге agent/workspace через инструменты
+list_files и read_file. Модель сама решает, когда их вызвать: ответ приходит
+с tool_calls, агент выполняет вызовы и возвращает результаты модели, пока она
+не даст обычный текстовый ответ (не длиннее MAX_STEPS шагов).
 
 Настройки берутся из agent/.env (см. agent/.env.example).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -45,7 +36,8 @@ DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_SYSTEM_PROMPT = (
     "Ты — ассистент проекта Computer Monitoring System. "
-    "Отвечай на русском языке, кратко и по делу."
+    "Отвечай на русском языке, кратко и по делу. "
+    "Если для ответа нужны файлы, используй инструменты list_files и read_file."
 )
 
 # Имена переменных, в которых может лежать ключ, в порядке приоритета.
@@ -53,6 +45,140 @@ API_KEY_VARS = ("ROUTERAI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
 
 EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit", "выход"}
 RESET_COMMANDS = {"/reset", "/clear"}
+
+# Рабочая папка агента: инструменты не выходят за её пределы.
+WORKSPACE = Path(__file__).with_name("workspace")
+
+# Ограничения, чтобы ответ инструмента не раздувал контекст.
+MAX_ITEMS = 200
+MAX_FILE_CHARS = 4000
+MAX_STEPS_DEFAULT = 8
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "Показать список файлов и папок в рабочей директории агента. "
+                "Используй, чтобы узнать, какие файлы доступны."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Относительный путь внутри рабочей папки. По умолчанию '.'",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Прочитать текстовый файл из рабочей директории агента. "
+                "Возвращает содержимое (длинный файл обрезается)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Относительный путь к файлу внутри рабочей папки.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+
+# --- инструменты -----------------------------------------------------------
+
+
+def _resolve_in_workspace(raw_path: str) -> Path:
+    """Приводит путь к абсолютному и проверяет, что он внутри WORKSPACE."""
+    candidate = (WORKSPACE / raw_path).resolve()
+    workspace = WORKSPACE.resolve()
+    if candidate != workspace and workspace not in candidate.parents:
+        raise ValueError(f"путь вне рабочей папки: {raw_path}")
+    return candidate
+
+
+def list_files(path: str = ".") -> str:
+    """Возвращает список файлов и папок внутри рабочей директории."""
+    target = _resolve_in_workspace(path)
+    if not target.exists():
+        raise FileNotFoundError(f"путь не найден: {path}")
+    if not target.is_dir():
+        raise NotADirectoryError(f"это не папка: {path}")
+
+    entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    lines = [
+        f"{entry.name}/" if entry.is_dir() else entry.name
+        for entry in entries[:MAX_ITEMS]
+    ]
+    if not lines:
+        return "(папка пуста)"
+    if len(entries) > MAX_ITEMS:
+        lines.append(f"... ещё {len(entries) - MAX_ITEMS} элементов")
+    return "\n".join(lines)
+
+
+def read_file(path: str) -> str:
+    """Возвращает содержимое текстового файла из рабочей директории."""
+    target = _resolve_in_workspace(path)
+    if not target.exists():
+        raise FileNotFoundError(f"файл не найден: {path}")
+    if not target.is_file():
+        raise IsADirectoryError(f"это папка, а не файл: {path}")
+
+    text = target.read_text(encoding="utf-8", errors="replace")
+    if len(text) > MAX_FILE_CHARS:
+        text = text[:MAX_FILE_CHARS] + f"\n... (обрезано, всего {len(text)} символов)"
+    return text or "(файл пуст)"
+
+
+TOOL_FUNCTIONS = {
+    "list_files": list_files,
+    "read_file": read_file,
+}
+
+
+def execute_tool(name: str, raw_args: str) -> str:
+    """Выполняет инструмент по имени и JSON-аргументам.
+
+    Любая ошибка (кривой JSON, неизвестный инструмент, исключение внутри
+    функции) возвращается строкой «ОШИБКА: ...», а не выбрасывается наружу:
+    агент должен продолжить работу и рассказать модели, что пошло не так.
+    """
+    try:
+        args = json.loads(raw_args) if raw_args and raw_args.strip() else {}
+    except json.JSONDecodeError as exc:
+        return f"ОШИБКА: не удалось разобрать аргументы JSON ({exc.msg}): {raw_args!r}"
+
+    if not isinstance(args, dict):
+        return f"ОШИБКА: аргументы должны быть JSON-объектом, получено {type(args).__name__}"
+
+    function = TOOL_FUNCTIONS.get(name)
+    if function is None:
+        available = ", ".join(sorted(TOOL_FUNCTIONS))
+        return f"ОШИБКА: неизвестный инструмент {name!r}. Доступны: {available}"
+
+    try:
+        return function(**args)
+    except TypeError as exc:
+        return f"ОШИБКА: неверные аргументы для {name}: {exc}"
+    except Exception as exc:  # noqa: BLE001 — любую ошибку возвращаем строкой
+        return f"ОШИБКА: {type(exc).__name__}: {exc}"
+
+
+# --- работа с API ----------------------------------------------------------
 
 
 def print_api_error(exc: APIStatusError) -> None:
@@ -74,10 +200,7 @@ def print_api_error(exc: APIStatusError) -> None:
 
 
 def request_completion(client: OpenAI, model: str, messages: list[dict]) -> tuple[str, str, object] | None:
-    """Отправляет всю историю messages и возвращает (текст, finish_reason, usage).
-
-    Возвращает None, если запрос не удался: сообщение об ошибке уже напечатано.
-    """
+    """Запрос без инструментов (шаг 1). Возвращает (текст, finish_reason, usage)."""
     try:
         response = client.chat.completions.create(model=model, messages=messages)
     except APIStatusError as exc:
@@ -109,8 +232,88 @@ def format_usage(usage: object) -> str:
     )
 
 
+def preview(text: str, limit: int = 300) -> str:
+    """Однострочный фрагмент для лога."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+# --- агентный цикл (шаг 3) -------------------------------------------------
+
+
+def run_agent(client: OpenAI, model: str, messages: list[dict], max_steps: int = MAX_STEPS_DEFAULT) -> str | None:
+    """Цикл «запрос → инструменты → ответ», не длиннее max_steps шагов.
+
+    messages изменяется на месте: в него добавляются сообщения ассистента
+    с tool_calls и сообщения с ролью tool. Возвращает финальный текст ответа
+    или None, если запрос к API не удался.
+    """
+    for step in range(1, max_steps + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+            )
+        except APIStatusError as exc:
+            print_api_error(exc)
+            return None
+
+        choice = response.choices[0] if response.choices else None
+        if choice is None or choice.message is None:
+            error = getattr(response, "error", None)
+            print("Модель не вернула ответ.", file=sys.stderr)
+            if error:
+                print(f"Причина: {error.get('message', error)}", file=sys.stderr)
+            else:
+                print(f"Сырой ответ: {response.model_dump()}", file=sys.stderr)
+            return None
+
+        message = choice.message
+        tool_calls = message.tool_calls or []
+
+        # В лог — имя инструмента, аргументы и usage: это идёт в отчёт.
+        print(
+            f"[шаг {step}/{max_steps}] {format_usage(response.usage)} "
+            f"finish_reason={choice.finish_reason}"
+        )
+
+        # Ответ ассистента сохраняется в историю целиком (с tool_calls),
+        # иначе модель не увидит связки «вызов → результат».
+        messages.append(message.model_dump(exclude_none=True))
+
+        if not tool_calls:
+            return message.content or ""
+
+        for call in tool_calls:
+            name = call.function.name
+            raw_args = call.function.arguments or "{}"
+            print(f"[шаг {step}] инструмент: {name} | аргументы: {raw_args}")
+
+            result = execute_tool(name, raw_args)
+            print(f"[шаг {step}] результат {name}: {preview(result)}")
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result,
+                }
+            )
+
+    # Лимит шагов исчерпан — честно сообщаем об этом и модели, и пользователю.
+    print(f"Достигнут лимит MAX_STEPS={max_steps}, агент остановлен.", file=sys.stderr)
+    return (
+        f"Не удалось завершить задачу за {max_steps} шагов. "
+        "Попробуйте уточнить запрос или увеличить MAX_STEPS."
+    )
+
+
+# --- режимы запуска --------------------------------------------------------
+
+
 def run_once(client: OpenAI, model: str) -> int:
-    """Шаг 1: один запрос без истории, с печатью content/finish_reason/usage."""
+    """Шаг 1: один запрос без истории и без инструментов."""
     result = request_completion(client, model, [{"role": "user", "content": QUESTION}])
     if result is None:
         return 1
@@ -136,13 +339,14 @@ def run_once(client: OpenAI, model: str) -> int:
     return 0
 
 
-def run_chat(client: OpenAI, model: str, system_prompt: str) -> int:
-    """Шаг 2: цикл input(), история переписки в списке messages."""
+def run_chat(client: OpenAI, model: str, system_prompt: str, max_steps: int) -> int:
+    """Шаги 2–3: цикл input(), история в messages, инструменты через run_agent."""
     # Первым в списке всегда идёт системный промпт.
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
     print(f"Модель: {model}")
-    print("Чат с историей. Команды: /reset — очистить историю, /exit — выход.")
+    print(f"Рабочая папка: {WORKSPACE}")
+    print("Команды: /reset — очистить историю, /exit — выход.")
     print()
 
     while True:
@@ -166,24 +370,16 @@ def run_chat(client: OpenAI, model: str, system_prompt: str) -> int:
         # вместе со всеми предыдущими репликами.
         messages.append({"role": "user", "content": question})
 
-        result = request_completion(client, model, messages)
-        if result is None:
+        answer = run_agent(client, model, messages, max_steps)
+        if answer is None:
             # Запрос не удался — убираем вопрос, чтобы история осталась согласованной.
             messages.pop()
             print("Реплика не добавлена в историю, попробуйте ещё раз.\n")
             continue
 
-        answer, finish_reason, usage = result
-
         print(f"Агент: {answer}")
-        print(f"[{format_usage(usage)}, finish_reason={finish_reason}, в истории {len(messages) + 1} сообщ.]")
+        print(f"[в истории {len(messages)} сообщ.]")
         print()
-
-        # Ответ модели тоже становится частью истории.
-        messages.append({"role": "assistant", "content": answer})
-
-        if finish_reason not in ("stop", "length"):
-            print(f"Внимание: неожиданный finish_reason = {finish_reason!r}", file=sys.stderr)
 
     print(f"Чат завершён. Сообщений в истории (вместе с системным): {len(messages)}")
     return 0
@@ -207,12 +403,18 @@ def main() -> int:
     base_url = os.getenv("BASE_URL", DEFAULT_BASE_URL)
     model = os.getenv("MODEL", DEFAULT_MODEL)
     system_prompt = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+    try:
+        max_steps = int(os.getenv("MAX_STEPS", str(MAX_STEPS_DEFAULT)))
+    except ValueError:
+        print("Ошибка: MAX_STEPS должен быть целым числом.", file=sys.stderr)
+        return 2
 
+    WORKSPACE.mkdir(exist_ok=True)
     client = OpenAI(base_url=base_url, api_key=api_key)
 
     if "--once" in sys.argv[1:]:
         return run_once(client, model)
-    return run_chat(client, model, system_prompt)
+    return run_chat(client, model, system_prompt, max_steps)
 
 
 if __name__ == "__main__":
